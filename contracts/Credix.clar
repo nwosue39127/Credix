@@ -21,6 +21,11 @@
 (define-constant ERR_GUARANTEE_NOT_FOUND (err u112))
 (define-constant ERR_GUARANTEE_ALREADY_CLAIMED (err u113))
 (define-constant ERR_GUARANTEE_EXPIRED (err u114))
+(define-constant ERR_INVALID_RATE (err u115))
+(define-constant ERR_RATE_ORACLE_NOT_AUTHORIZED (err u116))
+(define-constant ERR_RATE_UPDATE_TOO_FREQUENT (err u117))
+(define-constant ERR_RATE_BAND_VIOLATION (err u118))
+(define-constant ERR_MARKET_DATA_STALE (err u119))
 
 (define-map credit-profiles
   { user: principal }
@@ -103,9 +108,62 @@
   { loan-id: uint }
 )
 
+(define-map market-rate-data
+  { period: uint }
+  {
+    base-rate: uint,
+    utilization-rate: uint,
+    demand-pressure: uint,
+    supply-pressure: uint,
+    market-volatility: uint,
+    timestamp: uint,
+    total-supply: uint,
+    total-demand: uint
+  }
+)
+
+(define-map rate-oracle-config
+  { config-key: (string-ascii 32) }
+  {
+    value: uint,
+    last-updated: uint,
+    authorized-updater: principal
+  }
+)
+
+(define-map authorized-oracles
+  { oracle: principal }
+  { authorized: bool, permissions: uint }
+)
+
+(define-map rate-history
+  { timestamp: uint }
+  {
+    rate: uint,
+    reason: (string-ascii 64),
+    market-conditions: uint,
+    adjustment-magnitude: int
+  }
+)
+
+(define-map dynamic-rate-bands
+  { risk-tier: uint }
+  {
+    min-rate: uint,
+    max-rate: uint,
+    adjustment-factor: uint,
+    utilization-threshold: uint
+  }
+)
+
 (define-data-var next-loan-id uint u1)
 (define-data-var total-volume uint u0)
 (define-data-var total-guaranteed-volume uint u0)
+(define-data-var current-base-rate uint u500)
+(define-data-var rate-update-frequency uint u144)
+(define-data-var last-rate-update uint u0)
+(define-data-var market-utilization-rate uint u0)
+(define-data-var total-active-loans-value uint u0)
 
 (define-read-only (get-credit-profile (user principal))
   (map-get? credit-profiles { user: user })
@@ -196,6 +254,67 @@
 
 (define-read-only (get-total-guaranteed-volume)
   (var-get total-guaranteed-volume)
+)
+
+(define-read-only (get-market-rate-data (period uint))
+  (map-get? market-rate-data { period: period })
+)
+
+(define-read-only (get-rate-oracle-config (config-key (string-ascii 32)))
+  (map-get? rate-oracle-config { config-key: config-key })
+)
+
+(define-read-only (is-authorized-oracle (oracle principal))
+  (default-to false (get authorized (map-get? authorized-oracles { oracle: oracle })))
+)
+
+(define-read-only (get-rate-history (timestamp uint))
+  (map-get? rate-history { timestamp: timestamp })
+)
+
+(define-read-only (get-dynamic-rate-band (risk-tier uint))
+  (map-get? dynamic-rate-bands { risk-tier: risk-tier })
+)
+
+(define-read-only (get-current-base-rate)
+  (var-get current-base-rate)
+)
+
+(define-read-only (get-market-utilization-rate)
+  (var-get market-utilization-rate)
+)
+
+(define-read-only (calculate-dynamic-interest-rate (borrower-score uint) (loan-amount uint))
+  (let (
+    (base-rate (var-get current-base-rate))
+    (utilization-rate (var-get market-utilization-rate))
+    (risk-tier (if (>= borrower-score u750) u1 (if (>= borrower-score u650) u2 (if (>= borrower-score u550) u3 u4))))
+    (rate-band (get-dynamic-rate-band risk-tier))
+    (tier-adjustment (if (is-some rate-band) (get adjustment-factor (unwrap-panic rate-band)) u10))
+    (utilization-adjustment (/ (* utilization-rate u50) u100))
+    (risk-adjustment (if (< borrower-score u550) u100 (if (< borrower-score u650) u50 u0)))
+    (amount-adjustment (if (> loan-amount u100000) u25 u0))
+    (calculated-rate (+ base-rate tier-adjustment utilization-adjustment risk-adjustment amount-adjustment))
+    (min-rate (if (is-some rate-band) (get min-rate (unwrap-panic rate-band)) u100))
+    (max-rate (if (is-some rate-band) (get max-rate (unwrap-panic rate-band)) u2000))
+  )
+    (if (<= calculated-rate max-rate)
+      (if (>= calculated-rate min-rate) calculated-rate min-rate)
+      max-rate)
+  )
+)
+
+(define-read-only (get-market-health-score)
+  (let (
+    (utilization (var-get market-utilization-rate))
+    (total-vol (var-get total-volume))
+    (active-loans-value (var-get total-active-loans-value))
+    (health-base u100)
+    (utilization-penalty (if (> utilization u80) (* (- utilization u80) u2) u0))
+    (volume-bonus (if (> total-vol u1000000) u20 (/ total-vol u50000)))
+  )
+    (+ (- health-base utilization-penalty) volume-bonus)
+  )
 )
 
 (define-private (create-initial-profile (user principal))
@@ -308,6 +427,125 @@
   )
 )
 
+(define-private (update-market-utilization)
+  (let (
+    (total-supplied (var-get total-volume))
+    (total-active (var-get total-active-loans-value))
+  )
+    (if (> total-supplied u0)
+      (var-set market-utilization-rate (/ (* total-active u100) total-supplied))
+      (var-set market-utilization-rate u0)
+    )
+  )
+)
+
+(define-public (authorize-oracle (oracle principal) (permissions uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (map-set authorized-oracles
+      { oracle: oracle }
+      { authorized: true, permissions: permissions }
+    )
+    (ok true)
+  )
+)
+
+(define-public (initialize-rate-bands)
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (map-set dynamic-rate-bands { risk-tier: u1 } { min-rate: u100, max-rate: u500, adjustment-factor: u0, utilization-threshold: u70 })
+    (map-set dynamic-rate-bands { risk-tier: u2 } { min-rate: u200, max-rate: u800, adjustment-factor: u50, utilization-threshold: u75 })
+    (map-set dynamic-rate-bands { risk-tier: u3 } { min-rate: u400, max-rate: u1200, adjustment-factor: u100, utilization-threshold: u80 })
+    (map-set dynamic-rate-bands { risk-tier: u4 } { min-rate: u600, max-rate: u2000, adjustment-factor: u200, utilization-threshold: u85 })
+    (ok true)
+  )
+)
+
+(define-public (update-market-data (demand-pressure uint) (supply-pressure uint) (volatility uint))
+  (let (
+    (current-period (/ stacks-block-height u144))
+    (total-supply (var-get total-volume))
+    (total-demand (var-get total-active-loans-value))
+    (utilization-rate (var-get market-utilization-rate))
+  )
+    (asserts! (is-authorized-oracle tx-sender) ERR_RATE_ORACLE_NOT_AUTHORIZED)
+    (asserts! (<= demand-pressure u100) ERR_INVALID_AMOUNT)
+    (asserts! (<= supply-pressure u100) ERR_INVALID_AMOUNT)
+    (asserts! (<= volatility u100) ERR_INVALID_AMOUNT)
+    
+    (map-set market-rate-data
+      { period: current-period }
+      {
+        base-rate: (var-get current-base-rate),
+        utilization-rate: utilization-rate,
+        demand-pressure: demand-pressure,
+        supply-pressure: supply-pressure,
+        market-volatility: volatility,
+        timestamp: stacks-block-height,
+        total-supply: total-supply,
+        total-demand: total-demand
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (update-base-rate (new-rate uint) (reason (string-ascii 64)))
+  (let (
+    (current-rate (var-get current-base-rate))
+    (rate-change (if (>= new-rate current-rate) (to-int (- new-rate current-rate)) (- (to-int (- current-rate new-rate)))))
+    (last-update (var-get last-rate-update))
+    (update-frequency (var-get rate-update-frequency))
+    (blocks-since-update (- stacks-block-height last-update))
+  )
+    (asserts! (is-authorized-oracle tx-sender) ERR_RATE_ORACLE_NOT_AUTHORIZED)
+    (asserts! (and (>= new-rate u50) (<= new-rate u3000)) ERR_INVALID_RATE)
+    (asserts! (>= blocks-since-update update-frequency) ERR_RATE_UPDATE_TOO_FREQUENT)
+    
+    (var-set current-base-rate new-rate)
+    (var-set last-rate-update stacks-block-height)
+    
+    (map-set rate-history
+      { timestamp: stacks-block-height }
+      {
+        rate: new-rate,
+        reason: reason,
+        market-conditions: (get-market-health-score),
+        adjustment-magnitude: rate-change
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (auto-adjust-rates)
+  (let (
+    (utilization (var-get market-utilization-rate))
+    (current-rate (var-get current-base-rate))
+    (health-score (get-market-health-score))
+    (adjustment-factor (if (> utilization u80) 25 (if (< utilization u40) -25 0)))
+    (new-rate (if (>= adjustment-factor 0) (+ current-rate (to-uint adjustment-factor)) (- current-rate (to-uint (- adjustment-factor)))))
+    (bounded-rate (if (<= new-rate u3000) (if (>= new-rate u50) new-rate u50) u3000))
+  )
+    (asserts! (is-authorized-oracle tx-sender) ERR_RATE_ORACLE_NOT_AUTHORIZED)
+    (asserts! (not (is-eq adjustment-factor 0)) ERR_INVALID_AMOUNT)
+    
+    (var-set current-base-rate bounded-rate)
+    (var-set last-rate-update stacks-block-height)
+    
+    (map-set rate-history
+      { timestamp: stacks-block-height }
+      {
+        rate: bounded-rate,
+        reason: "AUTO_ADJUSTMENT",
+        market-conditions: health-score,
+        adjustment-magnitude: adjustment-factor
+      }
+    )
+    (ok bounded-rate)
+  )
+)
+
 (define-public (create-loan (borrower principal) (amount uint) (interest-rate uint) (duration uint))
   (let (
     (loan-id (var-get next-loan-id))
@@ -349,6 +587,8 @@
     (update-credit-profile borrower amount u0 1)
     (var-set next-loan-id (+ loan-id u1))
     (var-set total-volume (+ (var-get total-volume) amount))
+    (var-set total-active-loans-value (+ (var-get total-active-loans-value) amount))
+    (update-market-utilization)
     
     (ok loan-id)
   )
@@ -376,12 +616,19 @@
         })
       )
       
+      (if is-fully-repaid
+        (var-set total-active-loans-value (- (var-get total-active-loans-value) (get amount loan)))
+        true
+      )
+      
       (update-credit-profile 
         borrower 
         u0 
         amount 
         (if is-fully-repaid -1 0)
       )
+      
+      (update-market-utilization)
       
       (ok is-fully-repaid)
     )
@@ -591,3 +838,6 @@
     })
   )
 )
+
+
+
