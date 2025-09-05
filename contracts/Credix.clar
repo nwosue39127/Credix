@@ -839,5 +839,307 @@
   )
 )
 
+;; === LOAN RESTRUCTURING SYSTEM ===
+
+;; Restructuring error constants
+(define-constant ERR_RESTRUCTURE_REQUEST_EXISTS (err u200))
+(define-constant ERR_RESTRUCTURE_REQUEST_NOT_FOUND (err u201))
+(define-constant ERR_RESTRUCTURE_UNAUTHORIZED (err u202))
+(define-constant ERR_RESTRUCTURE_INVALID_PARAMS (err u203))
+(define-constant ERR_RESTRUCTURE_LOAN_REPAID (err u204))
+(define-constant ERR_RESTRUCTURE_ALREADY_APPROVED (err u205))
+
+;; Restructuring limits
+(define-constant MAX_RATE_MULTIPLIER u2) ;; 2x original rate
+(define-constant MAX_DURATION_MULTIPLIER u2) ;; 2x original duration
+
+;; Map to store restructure requests
+(define-map restructure-requests
+  { loan-id: uint }
+  {
+    borrower: principal,
+    lender: principal,
+    original-duration: uint,
+    original-rate: uint,
+    proposed-duration: uint,
+    proposed-rate: uint,
+    request-reason: (string-ascii 100),
+    requested-at: uint,
+    approved: bool,
+    approved-at: uint,
+    expires-at: uint
+  }
+)
+
+;; Map to track restructuring history per loan
+(define-map loan-restructure-history
+  { loan-id: uint }
+  {
+    total-restructures: uint,
+    last-restructure: uint,
+    original-terms-duration: uint,
+    original-terms-rate: uint
+  }
+)
+
+;; Request loan restructuring (borrower only)
+(define-public (request-restructure 
+    (loan-id uint) 
+    (proposed-duration uint) 
+    (proposed-rate uint) 
+    (reason (string-ascii 100))
+  )
+  (let (
+    (loan (unwrap! (get-loan loan-id) ERR_LOAN_NOT_FOUND))
+    (existing-request (map-get? restructure-requests { loan-id: loan-id }))
+    (original-duration (get duration loan))
+    (original-rate (get interest-rate loan))
+    )
+    
+    ;; Validation checks
+    (asserts! (is-eq tx-sender (get borrower loan)) ERR_RESTRUCTURE_UNAUTHORIZED)
+    (asserts! (not (get repaid loan)) ERR_RESTRUCTURE_LOAN_REPAID)
+    (asserts! (is-none existing-request) ERR_RESTRUCTURE_REQUEST_EXISTS)
+    
+    ;; Validate restructuring limits
+    (asserts! (<= proposed-rate (* original-rate MAX_RATE_MULTIPLIER)) ERR_RESTRUCTURE_INVALID_PARAMS)
+    (asserts! (<= proposed-duration (* original-duration MAX_DURATION_MULTIPLIER)) ERR_RESTRUCTURE_INVALID_PARAMS)
+    (asserts! (> proposed-duration u0) ERR_RESTRUCTURE_INVALID_PARAMS)
+    (asserts! (> proposed-rate u0) ERR_RESTRUCTURE_INVALID_PARAMS)
+    
+    ;; Create restructure request (expires in ~30 days)
+    (map-set restructure-requests
+      { loan-id: loan-id }
+      {
+        borrower: (get borrower loan),
+        lender: (get lender loan),
+        original-duration: original-duration,
+        original-rate: original-rate,
+        proposed-duration: proposed-duration,
+        proposed-rate: proposed-rate,
+        request-reason: reason,
+        requested-at: stacks-block-height,
+        approved: false,
+        approved-at: u0,
+        expires-at: (+ stacks-block-height u4320) ;; ~30 days
+      }
+    )
+    
+    ;; Initialize restructure history if needed
+    (if (is-none (map-get? loan-restructure-history { loan-id: loan-id }))
+      (map-set loan-restructure-history
+        { loan-id: loan-id }
+        {
+          total-restructures: u0,
+          last-restructure: u0,
+          original-terms-duration: original-duration,
+          original-terms-rate: original-rate
+        }
+      )
+      true
+    )
+    
+    ;; Emit event
+    (print {
+      event: "restructure-requested",
+      loan-id: loan-id,
+      borrower: (get borrower loan),
+      lender: (get lender loan),
+      proposed-duration: proposed-duration,
+      proposed-rate: proposed-rate,
+      reason: reason,
+      timestamp: stacks-block-height
+    })
+    
+    (ok true)
+  )
+)
+
+;; Approve loan restructuring (lender only)
+(define-public (approve-restructure (loan-id uint))
+  (let (
+    (loan (unwrap! (get-loan loan-id) ERR_LOAN_NOT_FOUND))
+    (request (unwrap! (map-get? restructure-requests { loan-id: loan-id }) ERR_RESTRUCTURE_REQUEST_NOT_FOUND))
+    (history (unwrap! (map-get? loan-restructure-history { loan-id: loan-id }) ERR_RESTRUCTURE_REQUEST_NOT_FOUND))
+    )
+    
+    ;; Validation checks
+    (asserts! (is-eq tx-sender (get lender loan)) ERR_RESTRUCTURE_UNAUTHORIZED)
+    (asserts! (not (get approved request)) ERR_RESTRUCTURE_ALREADY_APPROVED)
+    (asserts! (not (get repaid loan)) ERR_RESTRUCTURE_LOAN_REPAID)
+    (asserts! (< stacks-block-height (get expires-at request)) ERR_RESTRUCTURE_REQUEST_NOT_FOUND)
+    
+    ;; Update the loan with new terms
+    (map-set loans
+      { loan-id: loan-id }
+      (merge loan {
+        duration: (get proposed-duration request),
+        interest-rate: (get proposed-rate request)
+      })
+    )
+    
+    ;; Mark request as approved
+    (map-set restructure-requests
+      { loan-id: loan-id }
+      (merge request {
+        approved: true,
+        approved-at: stacks-block-height
+      })
+    )
+    
+    ;; Update restructure history
+    (map-set loan-restructure-history
+      { loan-id: loan-id }
+      (merge history {
+        total-restructures: (+ (get total-restructures history) u1),
+        last-restructure: stacks-block-height
+      })
+    )
+    
+    ;; Emit event
+    (print {
+      event: "restructure-approved",
+      loan-id: loan-id,
+      borrower: (get borrower loan),
+      lender: (get lender loan),
+      new-duration: (get proposed-duration request),
+      new-rate: (get proposed-rate request),
+      approved-at: stacks-block-height
+    })
+    
+    (ok true)
+  )
+)
+
+;; Reject loan restructuring (lender only)
+(define-public (reject-restructure (loan-id uint))
+  (let (
+    (loan (unwrap! (get-loan loan-id) ERR_LOAN_NOT_FOUND))
+    (request (unwrap! (map-get? restructure-requests { loan-id: loan-id }) ERR_RESTRUCTURE_REQUEST_NOT_FOUND))
+    )
+    
+    ;; Validation checks
+    (asserts! (is-eq tx-sender (get lender loan)) ERR_RESTRUCTURE_UNAUTHORIZED)
+    (asserts! (not (get approved request)) ERR_RESTRUCTURE_ALREADY_APPROVED)
+    (asserts! (< stacks-block-height (get expires-at request)) ERR_RESTRUCTURE_REQUEST_NOT_FOUND)
+    
+    ;; Remove the request
+    (map-delete restructure-requests { loan-id: loan-id })
+    
+    ;; Emit event
+    (print {
+      event: "restructure-rejected",
+      loan-id: loan-id,
+      borrower: (get borrower loan),
+      lender: (get lender loan),
+      rejected-at: stacks-block-height
+    })
+    
+    (ok true)
+  )
+)
+
+;; Cancel loan restructuring request (borrower only)
+(define-public (cancel-restructure-request (loan-id uint))
+  (let (
+    (loan (unwrap! (get-loan loan-id) ERR_LOAN_NOT_FOUND))
+    (request (unwrap! (map-get? restructure-requests { loan-id: loan-id }) ERR_RESTRUCTURE_REQUEST_NOT_FOUND))
+    )
+    
+    ;; Validation checks
+    (asserts! (is-eq tx-sender (get borrower loan)) ERR_RESTRUCTURE_UNAUTHORIZED)
+    (asserts! (not (get approved request)) ERR_RESTRUCTURE_ALREADY_APPROVED)
+    
+    ;; Remove the request
+    (map-delete restructure-requests { loan-id: loan-id })
+    
+    ;; Emit event
+    (print {
+      event: "restructure-cancelled",
+      loan-id: loan-id,
+      borrower: (get borrower loan),
+      lender: (get lender loan),
+      cancelled-at: stacks-block-height
+    })
+    
+    (ok true)
+  )
+)
+
+;; Read-only functions for restructuring
+
+(define-read-only (get-restructure-request (loan-id uint))
+  (let (
+    (request (map-get? restructure-requests { loan-id: loan-id }))
+    )
+    (if (is-some request)
+      (ok (unwrap-panic request))
+      (err ERR_RESTRUCTURE_REQUEST_NOT_FOUND)
+    )
+  )
+)
+
+(define-read-only (get-loan-restructure-history (loan-id uint))
+  (let (
+    (history (map-get? loan-restructure-history { loan-id: loan-id }))
+    )
+    (if (is-some history)
+      (ok (unwrap-panic history))
+      (err ERR_RESTRUCTURE_REQUEST_NOT_FOUND)
+    )
+  )
+)
+
+(define-read-only (is-restructure-request-active (loan-id uint))
+  (let (
+    (request (map-get? restructure-requests { loan-id: loan-id }))
+    )
+    (if (is-some request)
+      (let (
+        (request-data (unwrap-panic request))
+        )
+        (ok (and 
+          (not (get approved request-data))
+          (< stacks-block-height (get expires-at request-data))
+        ))
+      )
+      (ok false)
+    )
+  )
+)
+
+(define-read-only (get-restructure-eligibility (loan-id uint))
+  (let (
+    (loan (map-get? loans { loan-id: loan-id }))
+    (existing-request (map-get? restructure-requests { loan-id: loan-id }))
+    (history (map-get? loan-restructure-history { loan-id: loan-id }))
+    )
+    (if (is-some loan)
+      (let (
+        (loan-data (unwrap-panic loan))
+        (restructure-count (if (is-some history) (get total-restructures (unwrap-panic history)) u0))
+        )
+        (ok {
+          eligible: (and 
+            (not (get repaid loan-data))
+            (is-none existing-request)
+            (< restructure-count u3) ;; Max 3 restructures per loan
+          ),
+          reason: (if (get repaid loan-data) "loan-already-repaid"
+                    (if (is-some existing-request) "request-already-exists"
+                      (if (>= restructure-count u3) "max-restructures-reached"
+                        "eligible"
+                      )
+                    )
+                  ),
+          max-rate: (* (get interest-rate loan-data) MAX_RATE_MULTIPLIER),
+          max-duration: (* (get duration loan-data) MAX_DURATION_MULTIPLIER),
+          restructure-count: restructure-count
+        })
+      )
+      (err ERR_LOAN_NOT_FOUND)
+    )
+  )
+)
 
 
